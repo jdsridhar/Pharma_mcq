@@ -1,0 +1,1298 @@
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║  Pharmacy MCQ Platform — Prisma schema (Phase 2: full domain model)         ║
+// ║                                                                            ║
+// ║  GOLDEN RULE: a Question exists exactly once. It carries NO foreign keys to ║
+// ║  exams/curriculums/subjects — every such relationship is a *mapping* table. ║
+// ║                                                                            ║
+// ║  Conventions: UUID v7 PKs · Timestamptz · camelCase columns / snake_case   ║
+// ║  tables (@@map) · money as integer minor units · JSONB for flexible specs. ║
+// ║                                                                            ║
+// ║  Tenancy (§7-A): `organizationId` is a nullable, indexed *soft* column on   ║
+// ║  tenant-scoped tables (no Prisma relation) so content stays decoupled from  ║
+// ║  identity. FK + Row-Level-Security are applied via the supplemental SQL     ║
+// ║  migration (see prisma/sql/ and DATABASE_ARCHITECTURE.md).                  ║
+// ║                                                                            ║
+// ║  Declarative-only here. CHECK constraints, partial/trigram/GIN indexes,     ║
+// ║  RLS, partitioning and FTS live in prisma/sql/ (see DATABASE_INDEXING.md).  ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────── Enums ───────────────────────────────
+
+enum UserStatus {
+  ACTIVE
+  INACTIVE
+  SUSPENDED
+  PENDING_VERIFICATION
+}
+
+enum ContentStatus {
+  DRAFT
+  REVIEW
+  APPROVED
+  PUBLISHED
+  ARCHIVED
+}
+
+enum DifficultyLevel {
+  EASY
+  MEDIUM
+  HARD
+}
+
+enum QuestionType {
+  SINGLE_CHOICE
+  MULTI_CHOICE
+  TRUE_FALSE
+  NUMERIC
+  ASSERTION_REASON
+  MATCHING
+}
+
+enum KnowledgeRelationshipType {
+  IS_A
+  PART_OF
+  PREREQUISITE_OF
+  RELATED_TO
+}
+
+enum MediaType {
+  IMAGE
+  AUDIO
+  VIDEO
+  PDF
+}
+
+enum SessionStatus {
+  IN_PROGRESS
+  COMPLETED
+  ABANDONED
+  EXPIRED
+}
+
+enum MockTestMode {
+  FIXED
+  BLUEPRINT
+}
+
+enum GoalStatus {
+  ACTIVE
+  ACHIEVED
+  ABANDONED
+}
+
+enum RevisionSource {
+  WRONG_ANSWER
+  BOOKMARK
+  WEAK_TOPIC
+  TIME_GAP
+}
+
+enum RevisionItemStatus {
+  PENDING
+  DONE
+  SNOOZED
+}
+
+enum RevisionOutcome {
+  CORRECT
+  WRONG
+  SKIPPED
+}
+
+enum TrackProgressStatus {
+  NOT_STARTED
+  IN_PROGRESS
+  COMPLETED
+}
+
+enum BillingInterval {
+  MONTHLY
+  QUARTERLY
+  YEARLY
+  LIFETIME
+}
+
+enum SubscriptionStatus {
+  TRIALING
+  ACTIVE
+  PAST_DUE
+  CANCELLED
+  EXPIRED
+}
+
+enum PaymentProvider {
+  RAZORPAY
+  STRIPE
+  MANUAL
+}
+
+enum PaymentStatus {
+  CREATED
+  AUTHORIZED
+  CAPTURED
+  FAILED
+  REFUNDED
+}
+
+enum NotificationChannel {
+  EMAIL
+  SMS
+  PUSH
+  WHATSAPP
+}
+
+enum NotificationStatus {
+  PENDING
+  SENT
+  FAILED
+  READ
+}
+
+enum OutboxStatus {
+  PENDING
+  PROCESSING
+  PUBLISHED
+  FAILED
+}
+
+// ═════════════════════════════ Identity Domain ═════════════════════════════
+
+/// Tenant boundary (institution / org). Single default org until multi-tenancy activates.
+model Organization {
+  id        String   @id @default(uuid(7)) @db.Uuid
+  slug      String   @unique
+  name      String
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  @@map("organizations")
+}
+
+model User {
+  id              String     @id @default(uuid(7)) @db.Uuid
+  organizationId  String?    @db.Uuid
+  email           String
+  mobile          String?
+  name            String
+  passwordHash    String
+  status          UserStatus @default(PENDING_VERIFICATION)
+  emailVerifiedAt DateTime?  @db.Timestamptz(6)
+  lastLoginAt     DateTime?  @db.Timestamptz(6)
+  createdAt       DateTime   @default(now()) @db.Timestamptz(6)
+  updatedAt       DateTime   @updatedAt @db.Timestamptz(6)
+  deletedAt       DateTime?  @db.Timestamptz(6)
+
+  userRoles               UserRole[]
+  refreshTokens           RefreshToken[]
+  emailVerificationTokens EmailVerificationToken[]
+  passwordResetTokens     PasswordResetToken[]
+  studentProfile          StudentProfile?
+  preference              StudentPreference?
+  goals                   StudentGoal[]
+  trackProgress           TrackProgress[]
+  practiceSessions        PracticeSession[]
+  testSessions            TestSession[]
+  bookmarks               Bookmark[]
+  revisionItems           RevisionQueueItem[]
+  revisionHistory         RevisionHistory[]
+  masteries               StudentMastery[]
+  subscriptions           Subscription[]
+  payments                Payment[]
+  notifications           Notification[]
+  recommendationHistory   RecommendationHistory[]
+
+  @@unique([organizationId, email])
+  @@index([organizationId])
+  @@index([email])
+  @@map("users")
+}
+
+model Role {
+  id             String   @id @default(uuid(7)) @db.Uuid
+  organizationId String?  @db.Uuid
+  name           String
+  description    String?
+  isSystem       Boolean  @default(false)
+  createdAt      DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt      DateTime @updatedAt @db.Timestamptz(6)
+
+  rolePermissions RolePermission[]
+  userRoles       UserRole[]
+
+  @@unique([organizationId, name])
+  @@map("roles")
+}
+
+model Permission {
+  id          String   @id @default(uuid(7)) @db.Uuid
+  key         String   @unique // e.g. "question:approve"
+  resource    String // e.g. "question"
+  action      String // e.g. "approve"
+  description String?
+  createdAt   DateTime @default(now()) @db.Timestamptz(6)
+
+  rolePermissions RolePermission[]
+
+  @@index([resource])
+  @@map("permissions")
+}
+
+model RolePermission {
+  roleId       String @db.Uuid
+  permissionId String @db.Uuid
+
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+  @@index([permissionId])
+  @@map("role_permissions")
+}
+
+model UserRole {
+  userId     String   @db.Uuid
+  roleId     String   @db.Uuid
+  assignedAt DateTime @default(now()) @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role Role @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@id([userId, roleId])
+  @@index([roleId])
+  @@map("user_roles")
+}
+
+/// Refresh-token family for rotation + reuse detection (§SEC-3). Stored hashed.
+model RefreshToken {
+  id                  String    @id @default(uuid(7)) @db.Uuid
+  userId              String    @db.Uuid
+  familyId            String    @db.Uuid
+  tokenHash           String    @unique
+  expiresAt           DateTime  @db.Timestamptz(6)
+  revokedAt           DateTime? @db.Timestamptz(6)
+  replacedByTokenHash String?
+  userAgent           String?
+  ip                  String?
+  createdAt           DateTime  @default(now()) @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([familyId])
+  @@map("refresh_tokens")
+}
+
+model EmailVerificationToken {
+  id         String    @id @default(uuid(7)) @db.Uuid
+  userId     String    @db.Uuid
+  tokenHash  String    @unique
+  expiresAt  DateTime  @db.Timestamptz(6)
+  consumedAt DateTime? @db.Timestamptz(6)
+  createdAt  DateTime  @default(now()) @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("email_verification_tokens")
+}
+
+model PasswordResetToken {
+  id         String    @id @default(uuid(7)) @db.Uuid
+  userId     String    @db.Uuid
+  tokenHash  String    @unique
+  expiresAt  DateTime  @db.Timestamptz(6)
+  consumedAt DateTime? @db.Timestamptz(6)
+  createdAt  DateTime  @default(now()) @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("password_reset_tokens")
+}
+
+// ═════════════════════════════ Knowledge Domain ════════════════════════════
+// A directed graph (NOT a fixed Subject→Chapter→Topic tree). Hierarchical edge
+// types (IS_A/PART_OF/PREREQUISITE_OF) are constrained to a DAG via SQL trigger.
+
+model KnowledgeNode {
+  id          String    @id @default(uuid(7)) @db.Uuid
+  code        String    @unique
+  name        String
+  type        String // flexible categorization (e.g. DOMAIN/CONCEPT/DRUG) — not hardcoded
+  description String?
+  createdAt   DateTime  @default(now()) @db.Timestamptz(6)
+  updatedAt   DateTime  @updatedAt @db.Timestamptz(6)
+  deletedAt   DateTime? @db.Timestamptz(6)
+
+  outgoingEdges      KnowledgeEdge[]              @relation("KEdgeParent")
+  incomingEdges      KnowledgeEdge[]              @relation("KEdgeChild")
+  questionMappings   QuestionKnowledgeMapping[]
+  curriculumMappings CurriculumKnowledgeMapping[]
+  examMappings       ExamKnowledgeMapping[]
+  trackMappings      TrackKnowledgeMapping[]
+  blueprintItems     ExamBlueprintItem[]
+  masteries          StudentMastery[]
+  topicMetrics       TopicMetrics?
+
+  @@index([type])
+  @@map("knowledge_nodes")
+}
+
+model KnowledgeEdge {
+  id               String                    @id @default(uuid(7)) @db.Uuid
+  parentNodeId     String                    @db.Uuid
+  childNodeId      String                    @db.Uuid
+  relationshipType KnowledgeRelationshipType
+  weight           Float?
+  createdAt        DateTime                  @default(now()) @db.Timestamptz(6)
+
+  parent KnowledgeNode @relation("KEdgeParent", fields: [parentNodeId], references: [id], onDelete: Cascade)
+  child  KnowledgeNode @relation("KEdgeChild", fields: [childNodeId], references: [id], onDelete: Cascade)
+
+  @@unique([parentNodeId, childNodeId, relationshipType])
+  @@index([childNodeId])
+  @@map("knowledge_edges")
+}
+
+// ═════════════════════════════ Question Domain ═════════════════════════════
+
+model Question {
+  id                   String          @id @default(uuid(7)) @db.Uuid
+  /// Author's reference code. Unique PER ORGANIZATION among live rows (not globally) — enforced by
+  /// partial unique indexes in migration 20260607160000 (Prisma can't model partial/WHERE indexes).
+  /// Lets each institution keep its own code namespace; deleting a question frees its code.
+  questionCode         String
+  questionType         QuestionType
+  status               ContentStatus   @default(DRAFT)
+  authorDifficulty     DifficultyLevel @default(MEDIUM)
+  calculatedDifficulty Float?
+  language             String          @default("en")
+  /// Denormalized hash of the current published version's normalized text (fast dedup).
+  normalizedTextHash   String?
+  currentVersionId     String?         @unique @db.Uuid
+  createdById          String?         @db.Uuid // soft ref (content decoupled from identity)
+  /// Tenant owner. null = platform-shared (visible to every org); set = private to that institution.
+  organizationId       String?         @db.Uuid
+  createdAt            DateTime        @default(now()) @db.Timestamptz(6)
+  updatedAt            DateTime        @updatedAt @db.Timestamptz(6)
+  deletedAt            DateTime?       @db.Timestamptz(6)
+
+  currentVersion           QuestionVersion?            @relation("QCurrentVersion", fields: [currentVersionId], references: [id])
+  versions                 QuestionVersion[]           @relation("QVersions")
+  knowledgeMappings        QuestionKnowledgeMapping[]
+  examMappings             QuestionExamMapping[]
+  curriculumMappings       QuestionCurriculumMapping[]
+  trackMappings            QuestionTrackMapping[]
+  tagMappings              QuestionTagMapping[]
+  metrics                  QuestionMetrics?
+  practiceSessionQuestions PracticeSessionQuestion[]
+  practiceAnswers          PracticeAnswer[]
+  mockTestQuestions        MockTestQuestion[]
+  testQuestionSnapshots    TestQuestionSnapshot[]
+  bookmarks                Bookmark[]
+  revisionItems            RevisionQueueItem[]
+  revisionHistory          RevisionHistory[]
+
+  @@index([status])
+  @@index([normalizedTextHash])
+  @@index([createdById])
+  @@index([organizationId])
+  @@map("questions")
+}
+
+model QuestionVersion {
+  id                 String        @id @default(uuid(7)) @db.Uuid
+  questionId         String        @db.Uuid
+  versionNumber      Int
+  questionText       String
+  explanation        String?
+  /// Typed correct-answer specification keyed by QuestionType (numeric tolerance,
+  /// matching pairs, multi-correct sets, etc.) — drives the scoring strategy engine.
+  answerSpec         Json
+  normalizedTextHash String
+  status             ContentStatus @default(DRAFT)
+  createdById        String?       @db.Uuid
+  createdAt          DateTime      @default(now()) @db.Timestamptz(6)
+
+  question  Question         @relation("QVersions", fields: [questionId], references: [id], onDelete: Cascade)
+  currentOf Question?        @relation("QCurrentVersion")
+  options   QuestionOption[]
+  media     QuestionMedia[]
+
+  @@unique([questionId, versionNumber])
+  @@index([normalizedTextHash])
+  @@map("question_versions")
+}
+
+model QuestionOption {
+  id                String   @id @default(uuid(7)) @db.Uuid
+  questionVersionId String   @db.Uuid
+  optionText        String
+  isCorrect         Boolean  @default(false)
+  displayOrder      Int
+  createdAt         DateTime @default(now()) @db.Timestamptz(6)
+
+  version QuestionVersion @relation(fields: [questionVersionId], references: [id], onDelete: Cascade)
+
+  @@index([questionVersionId])
+  @@map("question_options")
+}
+
+model QuestionMedia {
+  id                String    @id @default(uuid(7)) @db.Uuid
+  questionVersionId String    @db.Uuid
+  mediaType         MediaType
+  url               String
+  altText           String?
+  displayOrder      Int       @default(0)
+  createdAt         DateTime  @default(now()) @db.Timestamptz(6)
+
+  version QuestionVersion @relation(fields: [questionVersionId], references: [id], onDelete: Cascade)
+
+  @@index([questionVersionId])
+  @@map("question_media")
+}
+
+model Tag {
+  id          String   @id @default(uuid(7)) @db.Uuid
+  name        String   @unique
+  slug        String   @unique
+  description String?
+  createdAt   DateTime @default(now()) @db.Timestamptz(6)
+
+  questionMappings QuestionTagMapping[]
+
+  @@map("tags")
+}
+
+// ───── Question Mapping Domain (the heart of the Golden Rule) ─────
+
+model QuestionKnowledgeMapping {
+  questionId      String @db.Uuid
+  knowledgeNodeId String @db.Uuid
+  weight          Float?
+
+  question      Question      @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  knowledgeNode KnowledgeNode @relation(fields: [knowledgeNodeId], references: [id], onDelete: Cascade)
+
+  @@id([questionId, knowledgeNodeId])
+  @@index([knowledgeNodeId])
+  @@map("question_knowledge_mapping")
+}
+
+model QuestionExamMapping {
+  questionId    String @db.Uuid
+  examProfileId String @db.Uuid
+  relevance     Float?
+
+  question    Question    @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  examProfile ExamProfile @relation(fields: [examProfileId], references: [id], onDelete: Cascade)
+
+  @@id([questionId, examProfileId])
+  @@index([examProfileId])
+  @@map("question_exam_mapping")
+}
+
+model QuestionCurriculumMapping {
+  questionId       String @db.Uuid
+  curriculumNodeId String @db.Uuid
+
+  question       Question       @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  curriculumNode CurriculumNode @relation(fields: [curriculumNodeId], references: [id], onDelete: Cascade)
+
+  @@id([questionId, curriculumNodeId])
+  @@index([curriculumNodeId])
+  @@map("question_curriculum_mapping")
+}
+
+model QuestionTrackMapping {
+  questionId    String @db.Uuid
+  trackModuleId String @db.Uuid
+
+  question    Question    @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  trackModule TrackModule @relation(fields: [trackModuleId], references: [id], onDelete: Cascade)
+
+  @@id([questionId, trackModuleId])
+  @@index([trackModuleId])
+  @@map("question_track_mapping")
+}
+
+model QuestionTagMapping {
+  questionId String @db.Uuid
+  tagId      String @db.Uuid
+
+  question Question @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  tag      Tag      @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([questionId, tagId])
+  @@index([tagId])
+  @@map("question_tag_mapping")
+}
+
+// ═════════════════════════════ Curriculum Domain ═══════════════════════════
+
+model Curriculum {
+  id          String        @id @default(uuid(7)) @db.Uuid
+  code        String        @unique
+  name        String
+  description String?
+  status      ContentStatus @default(DRAFT)
+  // Tenant owner. null = platform-shared; set = private to an institution. (RLS-ready soft column.)
+  organizationId String?    @db.Uuid
+  createdAt   DateTime      @default(now()) @db.Timestamptz(6)
+  updatedAt   DateTime      @updatedAt @db.Timestamptz(6)
+  deletedAt   DateTime?     @db.Timestamptz(6)
+
+  nodes CurriculumNode[]
+
+  @@index([organizationId])
+  @@map("curriculums")
+}
+
+model CurriculumNode {
+  id           String   @id @default(uuid(7)) @db.Uuid
+  curriculumId String   @db.Uuid
+  parentId     String?  @db.Uuid
+  name         String
+  code         String?
+  displayOrder Int      @default(0)
+  createdAt    DateTime @default(now()) @db.Timestamptz(6)
+
+  curriculum        Curriculum                   @relation(fields: [curriculumId], references: [id], onDelete: Cascade)
+  parent            CurriculumNode?              @relation("CurriculumTree", fields: [parentId], references: [id])
+  children          CurriculumNode[]             @relation("CurriculumTree")
+  knowledgeMappings CurriculumKnowledgeMapping[]
+  questionMappings  QuestionCurriculumMapping[]
+
+  @@index([curriculumId])
+  @@index([parentId])
+  @@map("curriculum_nodes")
+}
+
+model CurriculumKnowledgeMapping {
+  curriculumNodeId String @db.Uuid
+  knowledgeNodeId  String @db.Uuid
+
+  curriculumNode CurriculumNode @relation(fields: [curriculumNodeId], references: [id], onDelete: Cascade)
+  knowledgeNode  KnowledgeNode  @relation(fields: [knowledgeNodeId], references: [id], onDelete: Cascade)
+
+  @@id([curriculumNodeId, knowledgeNodeId])
+  @@index([knowledgeNodeId])
+  @@map("curriculum_knowledge_mapping")
+}
+
+// ═════════════════════════════ Exam Domain ═════════════════════════════════
+
+model ExamProfile {
+  id          String        @id @default(uuid(7)) @db.Uuid
+  code        String        @unique
+  name        String
+  description String?
+  status      ContentStatus @default(DRAFT)
+  // Tenant owner. null = platform-shared; set = private to an institution. (RLS-ready soft column.)
+  organizationId String?    @db.Uuid
+  createdAt   DateTime      @default(now()) @db.Timestamptz(6)
+  updatedAt   DateTime      @updatedAt @db.Timestamptz(6)
+  deletedAt   DateTime?     @db.Timestamptz(6)
+
+  blueprints        ExamBlueprint[]
+  knowledgeMappings ExamKnowledgeMapping[]
+  questionMappings  QuestionExamMapping[]
+  mockTests         MockTest[]
+  goals             StudentGoal[]
+  learningTracks    LearningTrack[]
+
+  @@index([organizationId])
+  @@map("exam_profiles")
+}
+
+model ExamBlueprint {
+  id              String   @id @default(uuid(7)) @db.Uuid
+  examProfileId   String   @db.Uuid
+  name            String
+  totalQuestions  Int
+  durationMinutes Int?
+  isActive        Boolean  @default(true)
+  createdAt       DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt       DateTime @updatedAt @db.Timestamptz(6)
+
+  examProfile ExamProfile         @relation(fields: [examProfileId], references: [id], onDelete: Cascade)
+  items       ExamBlueprintItem[]
+  mockTests   MockTest[]
+
+  @@index([examProfileId])
+  @@map("exam_blueprints")
+}
+
+/// One weighting row of a blueprint: subject/area, weightage, difficulty mix, count.
+model ExamBlueprintItem {
+  id              String  @id @default(uuid(7)) @db.Uuid
+  blueprintId     String  @db.Uuid
+  knowledgeNodeId String? @db.Uuid
+  label           String
+  weightPercent   Float
+  questionCount   Int
+  difficultyMix   Json? // { EASY: n, MEDIUM: n, HARD: n }
+
+  blueprint     ExamBlueprint  @relation(fields: [blueprintId], references: [id], onDelete: Cascade)
+  knowledgeNode KnowledgeNode? @relation(fields: [knowledgeNodeId], references: [id])
+
+  @@index([blueprintId])
+  @@index([knowledgeNodeId])
+  @@map("exam_blueprint_items")
+}
+
+model ExamKnowledgeMapping {
+  examProfileId   String @db.Uuid
+  knowledgeNodeId String @db.Uuid
+  importance      Float?
+
+  examProfile   ExamProfile   @relation(fields: [examProfileId], references: [id], onDelete: Cascade)
+  knowledgeNode KnowledgeNode @relation(fields: [knowledgeNodeId], references: [id], onDelete: Cascade)
+
+  @@id([examProfileId, knowledgeNodeId])
+  @@index([knowledgeNodeId])
+  @@map("exam_knowledge_mapping")
+}
+
+// ═════════════════════════════ Learning Domain ═════════════════════════════
+
+model LearningTrack {
+  id            String        @id @default(uuid(7)) @db.Uuid
+  code          String        @unique
+  name          String
+  description   String?
+  examProfileId String?       @db.Uuid
+  status        ContentStatus @default(DRAFT)
+  // Tenant owner. null = platform-shared; set = private to an institution. (RLS-ready soft column.)
+  organizationId String?      @db.Uuid
+  createdAt     DateTime      @default(now()) @db.Timestamptz(6)
+  updatedAt     DateTime      @updatedAt @db.Timestamptz(6)
+  deletedAt     DateTime?     @db.Timestamptz(6)
+
+  examProfile ExamProfile?  @relation(fields: [examProfileId], references: [id])
+  modules     TrackModule[]
+
+  @@index([examProfileId])
+  @@index([organizationId])
+  @@map("learning_tracks")
+}
+
+model TrackModule {
+  id           String   @id @default(uuid(7)) @db.Uuid
+  trackId      String   @db.Uuid
+  name         String
+  description  String?
+  displayOrder Int      @default(0)
+  createdAt    DateTime @default(now()) @db.Timestamptz(6)
+
+  track             LearningTrack           @relation(fields: [trackId], references: [id], onDelete: Cascade)
+  knowledgeMappings TrackKnowledgeMapping[]
+  questionMappings  QuestionTrackMapping[]
+  progress          TrackProgress[]
+
+  @@index([trackId])
+  @@map("track_modules")
+}
+
+model TrackKnowledgeMapping {
+  trackModuleId   String @db.Uuid
+  knowledgeNodeId String @db.Uuid
+
+  trackModule   TrackModule   @relation(fields: [trackModuleId], references: [id], onDelete: Cascade)
+  knowledgeNode KnowledgeNode @relation(fields: [knowledgeNodeId], references: [id], onDelete: Cascade)
+
+  @@id([trackModuleId, knowledgeNodeId])
+  @@index([knowledgeNodeId])
+  @@map("track_knowledge_mapping")
+}
+
+model TrackProgress {
+  id            String              @id @default(uuid(7)) @db.Uuid
+  userId        String              @db.Uuid
+  trackModuleId String              @db.Uuid
+  status        TrackProgressStatus @default(NOT_STARTED)
+  completedAt   DateTime?           @db.Timestamptz(6)
+  updatedAt     DateTime            @updatedAt @db.Timestamptz(6)
+
+  user        User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  trackModule TrackModule @relation(fields: [trackModuleId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, trackModuleId])
+  @@index([trackModuleId])
+  @@map("track_progress")
+}
+
+// ═════════════════════════════ Student Domain ══════════════════════════════
+
+model StudentProfile {
+  id             String   @id @default(uuid(7)) @db.Uuid
+  userId         String   @unique @db.Uuid
+  organizationId String?  @db.Uuid
+  educationLevel String?
+  college        String?
+  graduationYear Int?
+  createdAt      DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt      DateTime @updatedAt @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId])
+  @@map("student_profiles")
+}
+
+model StudentGoal {
+  id            String     @id @default(uuid(7)) @db.Uuid
+  userId        String     @db.Uuid
+  examProfileId String     @db.Uuid
+  targetYear    Int?
+  targetDate    DateTime?  @db.Date
+  status        GoalStatus @default(ACTIVE)
+  createdAt     DateTime   @default(now()) @db.Timestamptz(6)
+
+  user        User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  examProfile ExamProfile @relation(fields: [examProfileId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([examProfileId])
+  @@map("student_goals")
+}
+
+model StudentPreference {
+  id          String   @id @default(uuid(7)) @db.Uuid
+  userId      String   @unique @db.Uuid
+  preferences Json
+  updatedAt   DateTime @updatedAt @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("student_preferences")
+}
+
+// ═════════════════════════════ Practice Domain ═════════════════════════════
+
+model PracticeSession {
+  id             String        @id @default(uuid(7)) @db.Uuid
+  userId         String        @db.Uuid
+  organizationId String?       @db.Uuid
+  status         SessionStatus @default(IN_PROGRESS)
+  config         Json?
+  startedAt      DateTime      @default(now()) @db.Timestamptz(6)
+  completedAt    DateTime?     @db.Timestamptz(6)
+  createdAt      DateTime      @default(now()) @db.Timestamptz(6)
+
+  user      User                      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  questions PracticeSessionQuestion[]
+  answers   PracticeAnswer[]
+
+  @@index([userId])
+  @@index([organizationId])
+  @@map("practice_sessions")
+}
+
+model PracticeSessionQuestion {
+  id              String  @id @default(uuid(7)) @db.Uuid
+  sessionId       String  @db.Uuid
+  questionId      String  @db.Uuid
+  servedVersionId String? @db.Uuid
+  displayOrder    Int
+
+  session  PracticeSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  question Question        @relation(fields: [questionId], references: [id], onDelete: Cascade)
+
+  @@unique([sessionId, questionId])
+  @@index([questionId])
+  @@map("practice_session_questions")
+}
+
+model PracticeAnswer {
+  id                String   @id @default(uuid(7)) @db.Uuid
+  sessionId         String   @db.Uuid
+  questionId        String   @db.Uuid
+  selectedOptionIds Json?
+  answerPayload     Json?
+  isCorrect         Boolean?
+  timeMs            Int?
+  answeredAt        DateTime @default(now()) @db.Timestamptz(6)
+
+  session  PracticeSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  question Question        @relation(fields: [questionId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId])
+  @@index([questionId])
+  @@map("practice_answers")
+}
+
+// ═════════════════════════════ Assessment Domain ═══════════════════════════
+// Shared MockTest (cohort for ranking) vs per-user TestSession (attempt). Snapshots
+// freeze the exact question at attempt time and are immutable (§7-B, §P-2).
+
+model MockTest {
+  id              String        @id @default(uuid(7)) @db.Uuid
+  organizationId  String?       @db.Uuid
+  examProfileId   String?       @db.Uuid
+  blueprintId     String?       @db.Uuid
+  code            String        @unique
+  title           String
+  description     String?
+  mode            MockTestMode  @default(FIXED)
+  durationMinutes Int
+  totalQuestions  Int
+  status          ContentStatus @default(DRAFT)
+  opensAt         DateTime?     @db.Timestamptz(6)
+  closesAt        DateTime?     @db.Timestamptz(6)
+  createdById     String?       @db.Uuid
+  createdAt       DateTime      @default(now()) @db.Timestamptz(6)
+  updatedAt       DateTime      @updatedAt @db.Timestamptz(6)
+
+  examProfile ExamProfile?       @relation(fields: [examProfileId], references: [id])
+  blueprint   ExamBlueprint?     @relation(fields: [blueprintId], references: [id])
+  questions   MockTestQuestion[]
+  sessions    TestSession[]
+
+  @@index([organizationId])
+  @@index([examProfileId])
+  @@index([status])
+  @@map("mock_tests")
+}
+
+model MockTestQuestion {
+  id            String @id @default(uuid(7)) @db.Uuid
+  mockTestId    String @db.Uuid
+  questionId    String @db.Uuid
+  displayOrder  Int
+  marks         Float  @default(1)
+  negativeMarks Float  @default(0)
+
+  mockTest MockTest @relation(fields: [mockTestId], references: [id], onDelete: Cascade)
+  question Question @relation(fields: [questionId], references: [id], onDelete: Cascade)
+
+  @@unique([mockTestId, questionId])
+  @@index([questionId])
+  @@map("mock_test_questions")
+}
+
+model TestSession {
+  id             String        @id @default(uuid(7)) @db.Uuid
+  userId         String        @db.Uuid
+  organizationId String?       @db.Uuid
+  mockTestId     String?       @db.Uuid // null = ad-hoc generated exam (no cohort ranking)
+  status         SessionStatus @default(IN_PROGRESS)
+  startedAt      DateTime      @default(now()) @db.Timestamptz(6)
+  submittedAt    DateTime?     @db.Timestamptz(6)
+  expiresAt      DateTime?     @db.Timestamptz(6)
+  createdAt      DateTime      @default(now()) @db.Timestamptz(6)
+
+  user      User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  mockTest  MockTest?              @relation(fields: [mockTestId], references: [id])
+  snapshots TestQuestionSnapshot[]
+  answers   TestAnswer[]
+  result    Result?
+
+  @@index([userId])
+  @@index([mockTestId])
+  @@index([organizationId])
+  @@map("test_sessions")
+}
+
+/// Immutable JSONB freeze of a question (text/options/media/answerSpec) at attempt time.
+model TestQuestionSnapshot {
+  id                String  @id @default(uuid(7)) @db.Uuid
+  testSessionId     String  @db.Uuid
+  questionId        String? @db.Uuid // soft ref for analytics; scoring never reads live question
+  questionVersionId String? @db.Uuid
+  displayOrder      Int
+  snapshot          Json
+  marks             Float   @default(1)
+  negativeMarks     Float   @default(0)
+
+  testSession TestSession  @relation(fields: [testSessionId], references: [id], onDelete: Cascade)
+  question    Question?    @relation(fields: [questionId], references: [id])
+  answers     TestAnswer[]
+
+  @@index([testSessionId])
+  @@index([questionId])
+  @@map("test_question_snapshots")
+}
+
+model TestAnswer {
+  id                String   @id @default(uuid(7)) @db.Uuid
+  testSessionId     String   @db.Uuid
+  snapshotId        String   @db.Uuid
+  selectedOptionIds Json?
+  answerPayload     Json?
+  isCorrect         Boolean?
+  marksAwarded      Float?
+  timeMs            Int?
+  answeredAt        DateTime @default(now()) @db.Timestamptz(6)
+
+  testSession TestSession          @relation(fields: [testSessionId], references: [id], onDelete: Cascade)
+  snapshot    TestQuestionSnapshot @relation(fields: [snapshotId], references: [id], onDelete: Cascade)
+
+  @@unique([testSessionId, snapshotId])
+  @@map("test_answers")
+}
+
+model Result {
+  id            String   @id @default(uuid(7)) @db.Uuid
+  testSessionId String   @unique @db.Uuid
+  score         Float
+  maxScore      Float
+  accuracy      Float
+  correctCount  Int
+  wrongCount    Int
+  skippedCount  Int
+  timeTakenMs   Int?
+  rank          Int?
+  percentile    Float?
+  computedAt    DateTime @default(now()) @db.Timestamptz(6)
+
+  testSession TestSession @relation(fields: [testSessionId], references: [id], onDelete: Cascade)
+
+  @@map("results")
+}
+
+// ═════════════════════════════ Revision Domain ═════════════════════════════
+
+model RevisionQueueItem {
+  id             String             @id @default(uuid(7)) @db.Uuid
+  userId         String             @db.Uuid
+  questionId     String             @db.Uuid
+  source         RevisionSource
+  priority       Float              @default(0)
+  status         RevisionItemStatus @default(PENDING)
+  dueAt          DateTime?          @db.Timestamptz(6)
+  lastReviewedAt DateTime?          @db.Timestamptz(6)
+  reviewCount    Int                @default(0)
+  createdAt      DateTime           @default(now()) @db.Timestamptz(6)
+  updatedAt      DateTime           @updatedAt @db.Timestamptz(6)
+
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  question Question @relation(fields: [questionId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, questionId])
+  @@index([userId, dueAt])
+  @@index([questionId])
+  @@map("revision_queue")
+}
+
+model RevisionHistory {
+  id         String           @id @default(uuid(7)) @db.Uuid
+  userId     String           @db.Uuid
+  questionId String           @db.Uuid
+  outcome    RevisionOutcome?
+  reviewedAt DateTime         @default(now()) @db.Timestamptz(6)
+
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  question Question @relation(fields: [questionId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([questionId])
+  @@map("revision_history")
+}
+
+// ═════════════════════════════ Bookmark Domain ═════════════════════════════
+
+model Bookmark {
+  id         String   @id @default(uuid(7)) @db.Uuid
+  userId     String   @db.Uuid
+  questionId String   @db.Uuid
+  note       String?
+  createdAt  DateTime @default(now()) @db.Timestamptz(6)
+
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  question Question @relation(fields: [questionId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, questionId])
+  @@index([questionId])
+  @@map("bookmarks")
+}
+
+// ═════════════════════════════ Analytics Domain ════════════════════════════
+// `events` is converted to a monthly range-partitioned table by the supplemental
+// SQL migration (see DATABASE_INDEXING.md). userId/organizationId are soft columns.
+
+model Event {
+  id             String   @id @default(uuid(7)) @db.Uuid
+  organizationId String?  @db.Uuid
+  userId         String?  @db.Uuid
+  type           String
+  entityType     String?
+  entityId       String?  @db.Uuid
+  payload        Json?
+  occurredAt     DateTime @default(now()) @db.Timestamptz(6)
+  createdAt      DateTime @default(now()) @db.Timestamptz(6)
+
+  @@index([userId, occurredAt])
+  @@index([type, occurredAt])
+  @@index([entityType, entityId])
+  @@map("events")
+}
+
+model StudentMastery {
+  id              String   @id @default(uuid(7)) @db.Uuid
+  userId          String   @db.Uuid
+  knowledgeNodeId String   @db.Uuid
+  accuracy        Float    @default(0)
+  speedMsAvg      Int?
+  retention       Float?
+  revisionCount   Int      @default(0)
+  masteryScore    Float    @default(0)
+  updatedAt       DateTime @updatedAt @db.Timestamptz(6)
+
+  user          User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  knowledgeNode KnowledgeNode @relation(fields: [knowledgeNodeId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, knowledgeNodeId])
+  @@index([knowledgeNodeId])
+  @@map("student_mastery")
+}
+
+model TopicMetrics {
+  id              String   @id @default(uuid(7)) @db.Uuid
+  knowledgeNodeId String   @unique @db.Uuid
+  attempts        Int      @default(0)
+  correctRate     Float?
+  avgTimeMs       Int?
+  updatedAt       DateTime @updatedAt @db.Timestamptz(6)
+
+  knowledgeNode KnowledgeNode @relation(fields: [knowledgeNodeId], references: [id], onDelete: Cascade)
+
+  @@map("topic_metrics")
+}
+
+model QuestionMetrics {
+  id              String   @id @default(uuid(7)) @db.Uuid
+  questionId      String   @unique @db.Uuid
+  attempts        Int      @default(0)
+  correctCount    Int      @default(0)
+  skipCount       Int      @default(0)
+  correctRate     Float?
+  avgTimeMs       Int?
+  difficultyScore Float?
+  updatedAt       DateTime @updatedAt @db.Timestamptz(6)
+
+  question Question @relation(fields: [questionId], references: [id], onDelete: Cascade)
+
+  @@map("question_metrics")
+}
+
+// ═════════════════════════════ Recommendation Domain ═══════════════════════
+
+model RecommendationRule {
+  id          String   @id @default(uuid(7)) @db.Uuid
+  code        String   @unique
+  name        String
+  description String?
+  definition  Json
+  isActive    Boolean  @default(true)
+  priority    Int      @default(0)
+  createdAt   DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt   DateTime @updatedAt @db.Timestamptz(6)
+
+  history RecommendationHistory[]
+
+  @@map("recommendation_rules")
+}
+
+model RecommendationHistory {
+  id        String   @id @default(uuid(7)) @db.Uuid
+  userId    String   @db.Uuid
+  ruleId    String?  @db.Uuid
+  type      String
+  payload   Json
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+
+  user User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  rule RecommendationRule? @relation(fields: [ruleId], references: [id])
+
+  @@index([userId])
+  @@index([ruleId])
+  @@map("recommendation_history")
+}
+
+// ═════════════════════════════ Commerce Domain ═════════════════════════════
+
+model Plan {
+  id          String   @id @default(uuid(7)) @db.Uuid
+  code        String   @unique
+  name        String
+  description String?
+  isActive    Boolean  @default(true)
+  // Multi-tenancy: number of member seats granted to an institution. null = an Individual (B2C,
+  // per-user) plan; a positive value = an Institutional plan that caps the org's member count.
+  seatLimit   Int?
+  createdAt   DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt   DateTime @updatedAt @db.Timestamptz(6)
+
+  prices        PlanPrice[]
+  features      PlanFeature[]
+  subscriptions Subscription[]
+
+  @@map("plans")
+}
+
+model PlanPrice {
+  id              String          @id @default(uuid(7)) @db.Uuid
+  planId          String          @db.Uuid
+  billingInterval BillingInterval
+  amountMinor     Int // integer minor units (e.g. paise)
+  currency        String          @default("INR")
+  isActive        Boolean         @default(true)
+  createdAt       DateTime        @default(now()) @db.Timestamptz(6)
+
+  plan          Plan           @relation(fields: [planId], references: [id], onDelete: Cascade)
+  subscriptions Subscription[]
+
+  @@unique([planId, billingInterval, currency])
+  @@map("plan_prices")
+}
+
+model Feature {
+  id          String   @id @default(uuid(7)) @db.Uuid
+  key         String   @unique
+  name        String
+  description String?
+  createdAt   DateTime @default(now()) @db.Timestamptz(6)
+
+  planFeatures PlanFeature[]
+
+  @@map("features")
+}
+
+model PlanFeature {
+  planId    String @db.Uuid
+  featureId String @db.Uuid
+  limit     Int? // null = unlimited / boolean feature
+
+  plan    Plan    @relation(fields: [planId], references: [id], onDelete: Cascade)
+  feature Feature @relation(fields: [featureId], references: [id], onDelete: Cascade)
+
+  @@id([planId, featureId])
+  @@index([featureId])
+  @@map("plan_features")
+}
+
+model Subscription {
+  id                     String             @id @default(uuid(7)) @db.Uuid
+  userId                 String             @db.Uuid
+  organizationId         String?            @db.Uuid
+  planId                 String             @db.Uuid
+  planPriceId            String?            @db.Uuid
+  status                 SubscriptionStatus @default(TRIALING)
+  provider               PaymentProvider    @default(RAZORPAY)
+  providerSubscriptionId String?
+  currentPeriodStart     DateTime?          @db.Timestamptz(6)
+  currentPeriodEnd       DateTime?          @db.Timestamptz(6)
+  cancelAtPeriodEnd      Boolean            @default(false)
+  createdAt              DateTime           @default(now()) @db.Timestamptz(6)
+  updatedAt              DateTime           @updatedAt @db.Timestamptz(6)
+
+  user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  plan      Plan       @relation(fields: [planId], references: [id])
+  planPrice PlanPrice? @relation(fields: [planPriceId], references: [id])
+  payments  Payment[]
+
+  @@index([userId])
+  @@index([planId])
+  @@index([organizationId])
+  @@map("subscriptions")
+}
+
+model Payment {
+  id                String          @id @default(uuid(7)) @db.Uuid
+  userId            String          @db.Uuid
+  organizationId    String?         @db.Uuid
+  subscriptionId    String?         @db.Uuid
+  provider          PaymentProvider @default(RAZORPAY)
+  providerPaymentId String?         @unique
+  providerOrderId   String?
+  amountMinor       Int
+  currency          String          @default("INR")
+  status            PaymentStatus   @default(CREATED)
+  idempotencyKey    String          @unique
+  rawPayload        Json?
+  createdAt         DateTime        @default(now()) @db.Timestamptz(6)
+  updatedAt         DateTime        @updatedAt @db.Timestamptz(6)
+
+  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  subscription Subscription? @relation(fields: [subscriptionId], references: [id])
+
+  @@index([userId])
+  @@index([subscriptionId])
+  @@map("payments")
+}
+
+// ═════════════════════════════ Notification Domain ═════════════════════════
+
+model Notification {
+  id             String              @id @default(uuid(7)) @db.Uuid
+  organizationId String?             @db.Uuid
+  userId         String              @db.Uuid
+  channel        NotificationChannel
+  template       String
+  payload        Json?
+  status         NotificationStatus  @default(PENDING)
+  sentAt         DateTime?           @db.Timestamptz(6)
+  readAt         DateTime?           @db.Timestamptz(6)
+  error          String?
+  createdAt      DateTime            @default(now()) @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, status])
+  @@map("notifications")
+}
+
+// ═════════════════════════════ Administration Domain ═══════════════════════
+// Append-only audit log (no UPDATE/DELETE grant — enforced in SQL). actorUserId
+// is a soft ref so deleting a user never cascades away the audit trail.
+
+model AuditLog {
+  id             String   @id @default(uuid(7)) @db.Uuid
+  organizationId String?  @db.Uuid
+  actorUserId    String?  @db.Uuid
+  action         String
+  entityType     String
+  entityId       String?
+  before         Json?
+  after          Json?
+  ip             String?
+  userAgent      String?
+  createdAt      DateTime @default(now()) @db.Timestamptz(6)
+
+  @@index([entityType, entityId])
+  @@index([actorUserId])
+  @@index([organizationId])
+  @@map("audit_logs")
+}
+
+// ═════════════════════════════ Infrastructure ══════════════════════════════
+// Transactional outbox (§M-1): domain writes enqueue here in the same TX; a relay
+// worker publishes to BullMQ, giving exactly-once-ish delivery for events/notifications.
+
+model OutboxEvent {
+  id            String       @id @default(uuid(7)) @db.Uuid
+  aggregateType String
+  aggregateId   String
+  type          String
+  payload       Json
+  status        OutboxStatus @default(PENDING)
+  attempts      Int          @default(0)
+  availableAt   DateTime     @default(now()) @db.Timestamptz(6)
+  processedAt   DateTime?    @db.Timestamptz(6)
+  createdAt     DateTime     @default(now()) @db.Timestamptz(6)
+
+  @@index([status, availableAt])
+  @@map("outbox_events")
+}

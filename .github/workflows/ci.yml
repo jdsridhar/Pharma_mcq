@@ -1,0 +1,131 @@
+name: CI
+
+# Implements TESTING_STRATEGY.md §8 + SECURITY_ARCHITECTURE.md §12 (dependency audit).
+#   quality  — install → build → lint → typecheck → unit  (gates every PR; no services)
+#   security — dependency audit                            (non-blocking signal)
+#   e2e      — API e2e against real Postgres + Redis        (needs quality)
+#   docker   — build both production images (no push)       (needs quality; validates Dockerfiles)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '22'
+  PNPM_VERSION: '9.15.4'
+
+jobs:
+  quality:
+    name: Lint · Typecheck · Unit · Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build # turbo: builds contracts/config first, then api + web
+      - run: pnpm lint
+      - run: pnpm typecheck
+      - run: pnpm test # API 135 + web 12 unit tests
+
+  security:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # Report known advisories. Flip continue-on-error to false to make it a hard gate.
+      - run: pnpm audit --prod --audit-level high
+        continue-on-error: true
+
+  e2e:
+    name: API e2e (Postgres + Redis)
+    runs-on: ubuntu-latest
+    needs: quality
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: pharmacy
+          POSTGRES_PASSWORD: pharmacy
+          POSTGRES_DB: pharmacy_mcq_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U pharmacy -d pharmacy_mcq_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+    env:
+      NODE_ENV: test
+      DATABASE_URL: postgresql://pharmacy:pharmacy@localhost:5432/pharmacy_mcq_test?schema=public
+      REDIS_URL: redis://localhost:6379
+      # Non-production secrets only need >=16 chars (prod hardening is enforced separately).
+      JWT_ACCESS_SECRET: ci-access-secret-not-for-production
+      JWT_REFRESH_SECRET: ci-refresh-secret-not-for-production
+      APP_WEB_URL: http://localhost:3000
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @pharmacy/contracts --filter @pharmacy/config build
+      # Direct prisma/jest invocations (the package scripts wrap dotenv, which CI doesn't use).
+      - run: pnpm --filter @pharmacy/api exec prisma generate
+      - run: pnpm --filter @pharmacy/api exec prisma migrate deploy
+      - run: pnpm --filter @pharmacy/api exec prisma db execute --file prisma/sql/search_and_partitioning.sql --schema prisma/schema.prisma
+      # RLS policies + the pharmacy_app role (e2e connects as the owner via DATABASE_URL → RLS bypassed).
+      - run: pnpm --filter @pharmacy/api exec prisma db execute --file prisma/sql/rls.sql --schema prisma/schema.prisma
+      - run: pnpm --filter @pharmacy/api exec prisma db seed
+      - run: pnpm --filter @pharmacy/api exec jest --config ./test/jest-e2e.json --runInBand
+
+  docker:
+    name: Build images
+    runs-on: ubuntu-latest
+    needs: quality
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build API image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: apps/api/Dockerfile
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Build web image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: apps/web/Dockerfile
+          push: false
+          build-args: |
+            NEXT_PUBLIC_API_URL=https://api.example.com/api
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

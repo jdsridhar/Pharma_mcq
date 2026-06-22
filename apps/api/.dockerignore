@@ -1,0 +1,8 @@
+node_modules
+dist
+.turbo
+coverage
+**/*.spec.ts
+**/*.e2e-spec.ts
+.env
+.env.*

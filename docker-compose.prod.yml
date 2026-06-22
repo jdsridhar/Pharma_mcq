@@ -1,0 +1,102 @@
+name: pharmacy-mcq-prod
+
+# Production-oriented single-host topology. Datastores are NOT published to the host; only the
+# api/web ports are exposed (put a TLS-terminating reverse proxy / WAF in front — see
+# DEPLOYMENT_GUIDE.md). Provide a production `.env` (see .env.example; set real secrets).
+#
+#   docker compose -f docker-compose.prod.yml up -d --build
+#
+# `db-setup` runs migrations + SQL objects + seed ONCE, then exits; api/web wait for it to
+# complete, so app replicas never race on migrations. At scale, prefer managed Postgres/Redis
+# and run `db-setup` as a release Job instead of a compose service.
+
+x-api-env: &api-env
+  NODE_ENV: production
+  DATABASE_URL: postgresql://${POSTGRES_USER:-pharmacy}:${POSTGRES_PASSWORD:?set in .env}@postgres:5432/${POSTGRES_DB:-pharmacy_mcq}?schema=public
+  REDIS_URL: redis://redis:6379
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-pharmacy}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-pharmacy_mcq}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-pharmacy} -d ${POSTGRES_DB:-pharmacy_mcq}']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ['redis-server', '--appendonly', 'yes']
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # One-shot: apply schema migrations, advanced SQL objects (trigram/FTS/partitions), then seed.
+  db-setup:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    env_file: .env
+    environment: *api-env
+    restart: 'no'
+    depends_on:
+      postgres:
+        condition: service_healthy
+    working_dir: /repo/apps/api
+    command:
+      - sh
+      - -c
+      - >-
+        node ../../node_modules/prisma/build/index.js migrate deploy &&
+        node ../../node_modules/prisma/build/index.js db execute --file prisma/sql/search_and_partitioning.sql --schema prisma/schema.prisma &&
+        node ../../node_modules/prisma/build/index.js db execute --file prisma/sql/rls.sql --schema prisma/schema.prisma &&
+        node ../../node_modules/prisma/build/index.js db seed
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      <<: *api-env
+      APP_WEB_URL: ${APP_WEB_URL:?set in .env}
+    # Start-only: migrations are owned by db-setup, so replicas don't race.
+    command: ['node', 'dist/main.js']
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      db-setup:
+        condition: service_completed_successfully
+    ports:
+      - '${API_PORT:-4000}:4000'
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:?set in .env (e.g. https://api.example.com/api)}
+    restart: unless-stopped
+    depends_on:
+      - api
+    ports:
+      - '3000:3000'
+
+volumes:
+  pgdata:
+  redisdata:
